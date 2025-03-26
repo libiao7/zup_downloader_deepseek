@@ -152,15 +152,30 @@ async fn get_items_batch(data: web::Data<AppState>, search_request: web::Json<Se
 async fn get_items_batch_pq(data: web::Data<PgAppState>, search_request: web::Json<SearchRequest>) -> impl Responder {
     let client = data.pool.get().await.unwrap();
     let titles = &search_request.titles;
-    // 使用 ANY 结合 unnest 来简化多值匹配，并利用GIN索引加速LIKE操作
-    let values: Vec<String> = titles.iter()
-        .map(|title| format!("{}%", process_search_term(title)))
+    
+    // 构建动态SQL查询，确保每个标题都能被正确处理
+    let mut query_str = String::from("SELECT hash, title, dt, cat, size FROM items WHERE ");
+    let processed_titles: Vec<String> = titles.iter()
+        .map(|title| format!("%{}%", process_search_term(title)))
         .collect();
 
-    let query_str = "SELECT hash, title, dt, cat, size FROM items WHERE title % ANY($1::text[]) ORDER BY title ASC LIMIT 10000";
+    for (index, _) in processed_titles.iter().enumerate() {
+        if index > 0 {
+            query_str.push_str(" OR ");
+        }
+        query_str.push_str(&format!("title ILIKE ${}", index + 1));
+    }
+
+    query_str.push_str(" ORDER BY title ASC LIMIT 10000");
+
+    let stmt = client.prepare(&query_str).await.unwrap();
     
-    let stmt = client.prepare(query_str).await.unwrap();
-    let rows = client.query(&stmt, &[&values]).await.unwrap();
+    // 将 Vec 转换成切片，并且确保每个元素都实现了 ToSql + Sync
+    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = processed_titles.iter()
+        .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+    
+    let rows = client.query(&stmt, &params.as_slice()).await.unwrap();
 
     let items: Vec<Item> = rows.iter().map(|row| Item {
         hash: row.get(0),
