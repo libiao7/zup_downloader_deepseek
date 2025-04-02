@@ -1,6 +1,6 @@
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use deadpool_postgres::{Config, Pool, Runtime};
-use futures::future::join_all;
+// use futures::future::join_all;
 use reqwest::Client;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_postgres::NoTls;
 
 #[derive(Debug, Serialize)]
@@ -218,7 +219,7 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
     let mut failed_urls = Vec::new();
 
     let semaphore = Arc::new(Semaphore::new(8));
-    let mut tasks = Vec::new();
+    let mut joinset = JoinSet::new();
 
     for (index, url) in data.img_url_array.iter().enumerate() {
         let file_name = format!("{:04}.jpg", index + 1);
@@ -227,8 +228,8 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
         let semaphore = semaphore.clone();
         let success_count = success_count.clone();
 
-        tasks.push(tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
+        joinset.spawn(async move {
+            let _permit = semaphore.clone().acquire_owned().await.unwrap(); // 持有信号量许可
 
             if file_path.exists() {
                 return Ok(());
@@ -247,17 +248,15 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
                     Err(url)
                 }
             }
-        }));
+        });
     }
-
-    let results = join_all(tasks).await;
-
-    for result in results {
-        if let Ok(Err(url)) = result {
-            failed_urls.push(url);
+    while let Some(res) = joinset.join_next().await {
+        match res {
+            Ok(Ok(_)) => {}                                // 成功下载
+            Ok(Err(url)) => failed_urls.push(url),         // 下载失败
+            Err(e) => eprintln!("Task panicked: {:?}", e), // 任务崩溃
         }
     }
-
     println!("{}\n已完成！", title);
 
     if !failed_urls.is_empty() {
