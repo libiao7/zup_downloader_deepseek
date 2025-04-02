@@ -1,17 +1,17 @@
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use deadpool_postgres::{Config, Pool, Runtime};
-use tokio_postgres::NoTls;
-use rusqlite::{params, Connection};
-use serde::{Serialize, Deserialize};
-use std::sync::Mutex;
+use futures::future::join_all;
 use reqwest::Client;
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::copy;
 use std::path::Path;
-use futures::future::join_all;
-use tokio::sync::Semaphore;
-use std::sync::Arc;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::sync::Semaphore;
+use tokio_postgres::NoTls;
 
 #[derive(Debug, Serialize)]
 struct Item {
@@ -68,12 +68,15 @@ async fn download_image(url: &str, path: &Path) -> Result<(), String> {
 
     let mut file = fs::File::create(path).map_err(|e| e.to_string())?;
     copy(&mut content.as_ref(), &mut file).map_err(|e| e.to_string())?;
-    
+
     Ok(())
 }
 
 #[get("/rarbg")]
-async fn get_items(data: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> impl Responder {
+async fn get_items(
+    data: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> impl Responder {
     let conn = data.conn.lock().unwrap();
     let title_filter = query.get("title").map(|s| s.as_str());
 
@@ -84,20 +87,23 @@ async fn get_items(data: web::Data<AppState>, query: web::Query<std::collections
                 "SELECT hash, title, dt, cat, size FROM items WHERE LOWER(title) LIKE LOWER('%{}%') ORDER BY title ASC LIMIT 10000",
                 processed_title
             )
-        },
-        None => "SELECT hash, title, dt, cat, size FROM items ORDER BY title ASC LIMIT 10000".to_string(),
+        }
+        None => "SELECT hash, title, dt, cat, size FROM items ORDER BY title ASC LIMIT 10000"
+            .to_string(),
     };
 
     let mut stmt = conn.prepare(&query_str).unwrap();
-    let item_iter = stmt.query_map(params![], |row| {
-        Ok(Item {
-            hash: row.get(0)?,
-            title: row.get(1)?,
-            dt: row.get(2)?,
-            cat: row.get(3)?,
-            size: row.get(4)?,
+    let item_iter = stmt
+        .query_map(params![], |row| {
+            Ok(Item {
+                hash: row.get(0)?,
+                title: row.get(1)?,
+                dt: row.get(2)?,
+                cat: row.get(3)?,
+                size: row.get(4)?,
+            })
         })
-    }).unwrap();
+        .unwrap();
 
     let mut items = Vec::new();
     for item in item_iter {
@@ -108,37 +114,37 @@ async fn get_items(data: web::Data<AppState>, query: web::Query<std::collections
 }
 
 #[post("/rarbg/batch")]
-async fn get_items_batch(data: web::Data<AppState>, search_request: web::Json<SearchRequest>) -> impl Responder {
+async fn get_items_batch(
+    data: web::Data<AppState>,
+    search_request: web::Json<SearchRequest>,
+) -> impl Responder {
     let conn = data.conn.lock().unwrap();
     let titles = &search_request.titles;
 
-    let mut query_str = String::from(
-        "SELECT hash, title, dt, cat, size FROM items WHERE ",
-    );
+    let mut query_str = String::from("SELECT hash, title, dt, cat, size FROM items WHERE ");
 
     for (index, title) in titles.iter().enumerate() {
         let processed_title = process_search_term(title);
         if index > 0 {
             query_str.push_str(" OR ");
         }
-        query_str.push_str(&format!(
-            "LOWER(title) LIKE LOWER('%{}%')",
-            processed_title
-        ));
+        query_str.push_str(&format!("LOWER(title) LIKE LOWER('%{}%')", processed_title));
     }
 
     query_str.push_str(" ORDER BY title ASC LIMIT 10000");
 
     let mut stmt = conn.prepare(&query_str).unwrap();
-    let item_iter = stmt.query_map(params![], |row| {
-        Ok(Item {
-            hash: row.get(0)?,
-            title: row.get(1)?,
-            dt: row.get(2)?,
-            cat: row.get(3)?,
-            size: row.get(4)?,
+    let item_iter = stmt
+        .query_map(params![], |row| {
+            Ok(Item {
+                hash: row.get(0)?,
+                title: row.get(1)?,
+                dt: row.get(2)?,
+                cat: row.get(3)?,
+                size: row.get(4)?,
+            })
         })
-    }).unwrap();
+        .unwrap();
 
     let mut items = Vec::new();
     for item in item_iter {
@@ -149,13 +155,17 @@ async fn get_items_batch(data: web::Data<AppState>, search_request: web::Json<Se
 }
 
 #[post("/rarbg/batch_pq")]
-async fn get_items_batch_pq(data: web::Data<PgAppState>, search_request: web::Json<SearchRequest>) -> impl Responder {
+async fn get_items_batch_pq(
+    data: web::Data<PgAppState>,
+    search_request: web::Json<SearchRequest>,
+) -> impl Responder {
     let client = data.pool.get().await.unwrap();
     let titles = &search_request.titles;
-    
+
     // 构建动态SQL查询，确保每个标题都能被正确处理
     let mut query_str = String::from("SELECT hash, title, dt, cat, size FROM items WHERE ");
-    let processed_titles: Vec<String> = titles.iter()
+    let processed_titles: Vec<String> = titles
+        .iter()
         .map(|title| format!("%{}%", process_search_term(title)))
         .collect();
 
@@ -169,21 +179,25 @@ async fn get_items_batch_pq(data: web::Data<PgAppState>, search_request: web::Js
     query_str.push_str(" ORDER BY title ASC LIMIT 10000");
 
     let stmt = client.prepare(&query_str).await.unwrap();
-    
+
     // 将 Vec 转换成切片，并且确保每个元素都实现了 ToSql + Sync
-    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = processed_titles.iter()
+    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = processed_titles
+        .iter()
         .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
-    
+
     let rows = client.query(&stmt, &params.as_slice()).await.unwrap();
 
-    let items: Vec<Item> = rows.iter().map(|row| Item {
-        hash: row.get(0),
-        title: row.get(1),
-        dt: row.get(2),
-        cat: row.get(3),
-        size: row.get(4),
-    }).collect();
+    let items: Vec<Item> = rows
+        .iter()
+        .map(|row| Item {
+            hash: row.get(0),
+            title: row.get(1),
+            dt: row.get(2),
+            cat: row.get(3),
+            size: row.get(4),
+        })
+        .collect();
 
     HttpResponse::Ok().json(items)
 }
@@ -222,11 +236,12 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
 
             match download_image(&url, &file_path).await {
                 Ok(_) => {
-                    let current_count = success_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let current_count =
+                        success_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let progress = ((current_count + 1) as f32 / total_count as f32) * 100.0;
                     println!("Download progress: {:.2}%", progress);
                     Ok(())
-                },
+                }
                 Err(e) => {
                     eprintln!("Failed to download {}: {}", url, e);
                     Err(url)
@@ -246,16 +261,26 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
     println!("{}\n已完成！", title);
 
     if !failed_urls.is_empty() {
-        let html_content = format!(r#"<html>
+        let html_content = format!(
+            r#"<html>
             <body>
                 <h1><a href="{}">{}</a></h1>
                 <ul>
                     {}
                 </ul>
             </body>
-        </html>"#, page_url, title, failed_urls.iter().map(|url| format!("<li><a href=\"{}\">{}</a></li>", url, url)).collect::<Vec<_>>().join(""));
+        </html>"#,
+            page_url,
+            title,
+            failed_urls
+                .iter()
+                .map(|url| format!("<li><a href=\"{}\">{}</a></li>", url, url))
+                .collect::<Vec<_>>()
+                .join("")
+        );
 
-        fs::write(dir_path.join("failed_downloads.html"), html_content).expect("Failed to write HTML file");
+        fs::write(dir_path.join("failed_downloads.html"), html_content)
+            .expect("Failed to write HTML file");
     } else {
         let failed_file_path = dir_path.join("failed_downloads.html");
         if failed_file_path.exists() {
@@ -281,16 +306,15 @@ async fn init_pool() -> Pool {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let sqlite_conn = Connection::open("C:\\Users\\aa\\Downloads\\rarbg_db\\rarbg_db.sqlite").unwrap();
+    let sqlite_conn =
+        Connection::open("C:\\Users\\aa\\Downloads\\rarbg_db\\rarbg_db.sqlite").unwrap();
     let pg_pool = init_pool().await;
-    
+
     let app_state = web::Data::new(AppState {
         conn: Mutex::new(sqlite_conn),
     });
 
-    let pg_app_state = web::Data::new(PgAppState {
-        pool: pg_pool,
-    });
+    let pg_app_state = web::Data::new(PgAppState { pool: pg_pool });
 
     HttpServer::new(move || {
         App::new()
