@@ -1,15 +1,12 @@
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
+use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
 use deadpool_postgres::{Config, Pool, Runtime};
-// use futures::future::join_all;
 use reqwest::Client;
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::copy;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_postgres::NoTls;
@@ -35,100 +32,8 @@ struct SearchRequest {
     titles: Vec<String>,
 }
 
-struct AppState {
-    conn: Mutex<Connection>,
-}
-
 struct PgAppState {
     pool: Pool,
-}
-
-fn process_search_term(term: &str) -> String {
-    let term = term.split_whitespace().collect::<Vec<_>>().join(" ");
-    let term = term.replace(" ", ".%.");
-    format!("{}.", term)
-}
-
-#[get("/rarbg")]
-async fn get_items(
-    data: web::Data<AppState>,
-    query: web::Query<std::collections::HashMap<String, String>>,
-) -> impl Responder {
-    let conn = data.conn.lock().unwrap();
-    let title_filter = query.get("title").map(|s| s.as_str());
-
-    let query_str = match title_filter {
-        Some(title) => {
-            let processed_title = process_search_term(title);
-            format!(
-                "SELECT hash, title, dt, cat, size FROM items WHERE LOWER(title) LIKE LOWER('%{}%') ORDER BY title ASC LIMIT 10000",
-                processed_title
-            )
-        }
-        None => "SELECT hash, title, dt, cat, size FROM items ORDER BY title ASC LIMIT 10000"
-            .to_string(),
-    };
-
-    let mut stmt = conn.prepare(&query_str).unwrap();
-    let item_iter = stmt
-        .query_map(params![], |row| {
-            Ok(Item {
-                hash: row.get(0)?,
-                title: row.get(1)?,
-                dt: row.get(2)?,
-                cat: row.get(3)?,
-                size: row.get(4)?,
-            })
-        })
-        .unwrap();
-
-    let mut items = Vec::new();
-    for item in item_iter {
-        items.push(item.unwrap());
-    }
-
-    HttpResponse::Ok().json(items)
-}
-
-#[post("/rarbg/batch")]
-async fn get_items_batch(
-    data: web::Data<AppState>,
-    search_request: web::Json<SearchRequest>,
-) -> impl Responder {
-    let conn = data.conn.lock().unwrap();
-    let titles = &search_request.titles;
-
-    let mut query_str = String::from("SELECT hash, title, dt, cat, size FROM items WHERE ");
-
-    for (index, title) in titles.iter().enumerate() {
-        let processed_title = process_search_term(title);
-        if index > 0 {
-            query_str.push_str(" OR ");
-        }
-        query_str.push_str(&format!("LOWER(title) LIKE LOWER('%{}%')", processed_title));
-    }
-
-    query_str.push_str(" ORDER BY title ASC LIMIT 10000");
-
-    let mut stmt = conn.prepare(&query_str).unwrap();
-    let item_iter = stmt
-        .query_map(params![], |row| {
-            Ok(Item {
-                hash: row.get(0)?,
-                title: row.get(1)?,
-                dt: row.get(2)?,
-                cat: row.get(3)?,
-                size: row.get(4)?,
-            })
-        })
-        .unwrap();
-
-    let mut items = Vec::new();
-    for item in item_iter {
-        items.push(item.unwrap());
-    }
-
-    HttpResponse::Ok().json(items)
 }
 
 #[post("/rarbg/batch_pq")]
@@ -143,7 +48,12 @@ async fn get_items_batch_pq(
     let mut query_str = String::from("SELECT hash, title, dt, cat, size FROM items WHERE ");
     let processed_titles: Vec<String> = titles
         .iter()
-        .map(|title| format!("%{}%", process_search_term(title)))
+        .map(|title| {
+            format!(
+                "%{}.%",
+                title.split_whitespace().collect::<Vec<_>>().join(".%.")
+            )
+        })
         .collect();
 
     for (index, _) in processed_titles.iter().enumerate() {
@@ -302,22 +212,13 @@ async fn init_pool() -> Pool {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let sqlite_conn =
-        Connection::open("C:\\Users\\aa\\Downloads\\rarbg_db\\rarbg_db.sqlite").unwrap();
     let pg_pool = init_pool().await;
-
-    let app_state = web::Data::new(AppState {
-        conn: Mutex::new(sqlite_conn),
-    });
 
     let pg_app_state = web::Data::new(PgAppState { pool: pg_pool });
 
     HttpServer::new(move || {
         App::new()
-            .app_data(app_state.clone())
             .app_data(pg_app_state.clone())
-            .service(get_items)
-            .service(get_items_batch)
             .service(handle_post)
             .service(get_items_batch_pq)
     })
