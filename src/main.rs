@@ -49,30 +49,6 @@ fn process_search_term(term: &str) -> String {
     format!("{}.", term)
 }
 
-async fn download_image(url: &str, path: &Path) -> Result<(), String> {
-    let client = Client::builder()
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
-
-    if !response.status().is_success() {
-        return Err(format!("Failed to download image: {}", response.status()));
-    }
-
-    let content = response.bytes().await.map_err(|e| e.to_string())?;
-
-    if content.is_empty() {
-        return Err("Downloaded file is empty".to_string());
-    }
-
-    let mut file = fs::File::create(path).map_err(|e| e.to_string())?;
-    copy(&mut content.as_ref(), &mut file).map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
 #[get("/rarbg")]
 async fn get_items(
     data: web::Data<AppState>,
@@ -289,6 +265,30 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
         .output();
 
     HttpResponse::Ok().body(format!("{}\n已完成！", title))
+}
+
+async fn download_image(url: &str, path: &Path) -> Result<(), String> {
+    let client = Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("Failed to download image: {}", response.status()));
+    }
+
+    let content = response.bytes().await.map_err(|e| e.to_string())?;
+
+    if content.is_empty() {
+        return Err("Downloaded file is empty".to_string());
+    }
+
+    let mut file = fs::File::create(path).map_err(|e| e.to_string())?;
+    copy(&mut content.as_ref(), &mut file).map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 async fn init_pool() -> Pool {
