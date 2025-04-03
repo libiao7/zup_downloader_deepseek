@@ -214,10 +214,6 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
         fs::create_dir_all(&dir_path).expect("Failed to create directory");
     }
 
-    let total_count = data.img_url_array.len();
-    let success_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut failed_urls = Vec::new();
-
     let semaphore = Arc::new(Semaphore::new(8));
     let mut joinset = JoinSet::new();
 
@@ -226,23 +222,16 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
         let file_path = dir_path.join(&file_name);
         let url = url.clone();
         let semaphore = semaphore.clone();
-        let success_count = success_count.clone();
 
         joinset.spawn(async move {
             let _permit = semaphore.clone().acquire_owned().await.unwrap(); // 持有信号量许可
 
             if file_path.exists() {
-                return Ok(());
+                return Ok("existed");
             }
 
             match download_image(&url, &file_path).await {
-                Ok(_) => {
-                    let current_count =
-                        success_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let progress = ((current_count + 1) as f32 / total_count as f32) * 100.0;
-                    println!("Download progress: {:.2}%", progress);
-                    Ok(())
-                }
+                Ok(_) => Ok("OK"),
                 Err(e) => {
                     eprintln!("Failed to download {}: {}", url, e);
                     Err(url)
@@ -250,10 +239,18 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
             }
         });
     }
+
+    let total_count = data.img_url_array.len();
+    let mut success_count = 0;
+    let mut failed_urls = Vec::new();
+
     while let Some(res) = joinset.join_next().await {
         match res {
-            Ok(Ok(_)) => {}                                // 成功下载
-            Ok(Err(url)) => failed_urls.push(url),         // 下载失败
+            Ok(Ok(t)) => {
+                success_count += 1;
+                println!("{t}: {total_count}---{success_count}");
+            }
+            Ok(Err(url)) => failed_urls.push(url), // 下载失败
             Err(e) => eprintln!("Task panicked: {:?}", e), // 任务崩溃
         }
     }
