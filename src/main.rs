@@ -46,21 +46,21 @@ async fn get_items_batch_pq(
 
     // 构建动态SQL查询，确保每个标题都能被正确处理
     let mut query_str = String::from("SELECT hash, title, dt, cat, size FROM items WHERE ");
-    let processed_titles: Vec<String> = titles
-        .iter()
-        .map(|title| {
-            format!(
-                "%{}.%",
-                title.split_whitespace().collect::<Vec<_>>().join(".%.")
-            )
-        })
-        .collect();
+    // let processed_titles: Vec<String> = titles
+    //     .iter()
+    //     .map(|title| {
+    //         format!(
+    //             "%{}.%",
+    //             title.split_whitespace().collect::<Vec<_>>().join(".%.")
+    //         )
+    //     })
+    //     .collect();
 
-    for (index, _) in processed_titles.iter().enumerate() {
+    for (index, _) in titles.iter().enumerate() {
         if index > 0 {
             query_str.push_str(" OR ");
         }
-        query_str.push_str(&format!("title ILIKE ${}", index + 1));
+        query_str.push_str(&format!("lower(title) LIKE lower(${})", index + 1));
     }
 
     query_str.push_str(" ORDER BY title ASC LIMIT 10000");
@@ -68,7 +68,7 @@ async fn get_items_batch_pq(
     let stmt = client.prepare(&query_str).await.unwrap();
 
     // 将 Vec 转换成切片，并且确保每个元素都实现了 ToSql + Sync
-    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = processed_titles
+    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = titles
         .iter()
         .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
@@ -206,7 +206,7 @@ async fn init_pool() -> Pool {
     cfg.host = Some("localhost".to_string());
     cfg.user = Some("postgres".to_string());
     cfg.password = Some("4545".to_string());
-    cfg.dbname = Some("your_database_name".to_string());
+    cfg.dbname = Some("rarbg".to_string());
     cfg.create_pool(Some(Runtime::Tokio1), NoTls).unwrap()
 }
 
