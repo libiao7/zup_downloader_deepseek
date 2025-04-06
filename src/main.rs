@@ -32,49 +32,36 @@ struct SearchRequest {
     titles: Vec<String>,
 }
 
-struct PgAppState {
-    pool: Pool,
+struct AppState {
+    pg_pool: Pool,
+    http_client: Client,                // 共享的 reqwest::Client
+    download_semaphore: Arc<Semaphore>, // 全局下载信号量
 }
 
 #[post("/rarbg/batch_pq")]
 async fn get_items_batch_pq(
-    data: web::Data<PgAppState>,
+    data: web::Data<AppState>,
     search_request: web::Json<SearchRequest>,
 ) -> impl Responder {
-    let client = data.pool.get().await.unwrap();
+    let client = data.pg_pool.get().await.unwrap();
     let titles = &search_request.titles;
 
-    // 构建动态SQL查询，确保每个标题都能被正确处理
     let mut query_str = String::from("SELECT hash, title, dt, cat, size FROM items WHERE ");
-    // let processed_titles: Vec<String> = titles
-    //     .iter()
-    //     .map(|title| {
-    //         format!(
-    //             "%{}.%",
-    //             title.split_whitespace().collect::<Vec<_>>().join(".%.")
-    //         )
-    //     })
-    //     .collect();
-
     for (index, _) in titles.iter().enumerate() {
         if index > 0 {
             query_str.push_str(" OR ");
         }
         query_str.push_str(&format!("lower(title) LIKE lower(${})", index + 1));
     }
-
     query_str.push_str(" ORDER BY title ASC LIMIT 10000");
 
     let stmt = client.prepare(&query_str).await.unwrap();
-
-    // 将 Vec 转换成切片，并且确保每个元素都实现了 ToSql + Sync
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = titles
         .iter()
         .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
 
     let rows = client.query(&stmt, &params.as_slice()).await.unwrap();
-
     let items: Vec<Item> = rows
         .iter()
         .map(|row| Item {
@@ -90,7 +77,7 @@ async fn get_items_batch_pq(
 }
 
 #[post("/zup")]
-async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
+async fn handle_post(data: web::Json<ImageData>, app_state: web::Data<AppState>) -> impl Responder {
     let title = &data.title;
     let page_url = &data.page_url;
     let base_dir = Path::new("C:\\Users\\aa\\Desktop\\zup");
@@ -100,26 +87,25 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
         fs::create_dir_all(&dir_path).expect("Failed to create directory");
     }
 
-    let semaphore = Arc::new(Semaphore::new(8));
     let mut joinset = JoinSet::new();
 
     for (index, url) in data.img_url_array.iter().enumerate() {
         let file_name = format!("{:04}.jpg", index + 1);
         let file_path = dir_path.join(&file_name);
         let url = url.clone();
-        let semaphore = semaphore.clone();
-
+        let semaphore = app_state.download_semaphore.clone(); // 使用全局信号量
+        let task_client = app_state.http_client.clone();
         joinset.spawn(async move {
-            let _permit = semaphore.clone().acquire_owned().await.unwrap(); // 持有信号量许可
+            let _permit = semaphore.acquire_owned().await.unwrap();
 
             if file_path.exists() {
                 return Ok("existed");
             }
 
-            match download_image(&url, &file_path).await {
+            match download_image(task_client, &url, &file_path).await {
                 Ok(_) => Ok("OK"),
                 Err(e) => {
-                    eprintln!("Failed to download {}: {}", url, e);
+                    eprintln!("e: {}: {}", e, url);
                     Err(url)
                 }
             }
@@ -136,22 +122,15 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
                 success_count += 1;
                 println!("{t}: {total_count}---{success_count}");
             }
-            Ok(Err(url)) => failed_urls.push(url), // 下载失败
-            Err(e) => eprintln!("Task panicked: {:?}", e), // 任务崩溃
+            Ok(Err(url)) => failed_urls.push(url),
+            Err(e) => eprintln!("Task panicked: {:?}", e),
         }
     }
     println!("{}\n已完成！", title);
 
     if !failed_urls.is_empty() {
         let html_content = format!(
-            r#"<html>
-            <body>
-                <h1><a href="{}">{}</a></h1>
-                <ul>
-                    {}
-                </ul>
-            </body>
-        </html>"#,
+            r#"<html><body><h1><a href="{}">{}</a></h1><ul>{}</ul></body></html>"#,
             page_url,
             title,
             failed_urls
@@ -160,7 +139,6 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
                 .collect::<Vec<_>>()
                 .join("")
         );
-
         fs::write(dir_path.join("failed_downloads.html"), html_content)
             .expect("Failed to write HTML file");
     } else {
@@ -177,12 +155,7 @@ async fn handle_post(data: web::Json<ImageData>) -> impl Responder {
     HttpResponse::Ok().body(format!("{}\n已完成！", title))
 }
 
-async fn download_image(url: &str, path: &Path) -> Result<(), String> {
-    let client = Client::builder()
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
-
+async fn download_image(client: Client, url: &str, path: &Path) -> Result<(), String> {
     let response = client.get(url).send().await.map_err(|e| e.to_string())?;
 
     if !response.status().is_success() {
@@ -190,7 +163,6 @@ async fn download_image(url: &str, path: &Path) -> Result<(), String> {
     }
 
     let content = response.bytes().await.map_err(|e| e.to_string())?;
-
     if content.is_empty() {
         return Err("Downloaded file is empty".to_string());
     }
@@ -213,12 +185,20 @@ async fn init_pool() -> Pool {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let pg_pool = init_pool().await;
+    let http_client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to create HTTP client");
 
-    let pg_app_state = web::Data::new(PgAppState { pool: pg_pool });
+    let app_state = web::Data::new(AppState {
+        pg_pool,
+        http_client,                                     // 共享的 Client
+        download_semaphore: Arc::new(Semaphore::new(8)), // 全局8个并发许可
+    });
 
     HttpServer::new(move || {
         App::new()
-            .app_data(pg_app_state.clone())
+            .app_data(app_state.clone()) // 克隆 web::Data (Arc)
             .service(handle_post)
             .service(get_items_batch_pq)
     })
