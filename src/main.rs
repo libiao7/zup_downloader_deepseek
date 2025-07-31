@@ -78,10 +78,8 @@ async fn get_items_batch_pq(
 
 #[post("/zup")]
 async fn handle_post(data: web::Json<ImageData>, app_state: web::Data<AppState>) -> impl Responder {
-    let title = &data.title;
     let page_url = &data.page_url;
-    let base_dir = Path::new("C:\\Users\\aa\\Desktop\\zup");
-    let dir_path = base_dir.join(title);
+    let dir_path = Path::new("C:\\Users\\aa\\Desktop\\zup").join(&data.title);
 
     if !dir_path.exists() {
         fs::create_dir_all(&dir_path).expect("Failed to create directory");
@@ -126,13 +124,13 @@ async fn handle_post(data: web::Json<ImageData>, app_state: web::Data<AppState>)
             Err(e) => eprintln!("Task panicked: {:?}", e),
         }
     }
-    println!("{}\n已完成！", title);
+    println!("{}\n已完成！", &data.title);
 
     if !failed_urls.is_empty() {
         let html_content = format!(
             r#"<html><body><h1><a href="{}">{}</a></h1><ul>{}</ul></body></html>"#,
             page_url,
-            title,
+            &data.title,
             failed_urls
                 .iter()
                 .map(|url| format!("<li><a href=\"{}\">{}</a></li>", url, url))
@@ -152,7 +150,7 @@ async fn handle_post(data: web::Json<ImageData>, app_state: web::Data<AppState>)
         .arg(dir_path.to_str().unwrap())
         .output();
 
-    HttpResponse::Ok().body(format!("{}\n已完成！", title))
+    HttpResponse::Ok().body(format!("{}\n已完成！", &data.title))
 }
 
 async fn download_image(client: Client, url: &str, path: &Path) -> Result<(), String> {
